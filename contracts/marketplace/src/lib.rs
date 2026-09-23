@@ -1,4 +1,26 @@
 #![no_std]
+//! Marketplace contract for trading NFT bots.
+//!
+//! ## Events
+//!
+//! The marketplace emits the following events:
+//! - `initialized`: Emitted when the contract is initialized with admin, bot_nft, and fee_recipient.
+//!   Topics: ("initialized",), Data: (admin, bot_nft, fee_recipient)
+//! - `listed`: Emitted when a bot is listed for sale.
+//!   Topics: ("listed", seller, listing_id), Data: (bot_id, price)
+//! - `sold`: Emitted when a bot is purchased.
+//!   Topics: ("sold", seller, buyer), Data: (listing_id, bot_id, price)
+//! - `cancel`: Emitted when a listing is cancelled.
+//!   Topics: ("cancel", seller, listing_id), Data: (bot_id,)
+//! - `fee_bps_updated`: Emitted when the fee basis points are updated.
+//!   Topics: ("fee_bps_updated",), Data: (old_fee_bps, new_fee_bps)
+//! - `fee_recipient_updated`: Emitted when the fee recipient is updated.
+//!   Topics: ("fee_recipient_updated",), Data: (old_recipient, new_recipient)
+//! - `bot_nft_updated`: Emitted when the bot NFT address is updated.
+//!   Topics: ("bot_nft_updated",), Data: (old_nft, new_nft)
+//! - `admin_updated`: Emitted when the admin is updated.
+//!   Topics: ("admin_updated",), Data: (old_admin, new_admin)
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, symbol_short,
     token::Client as TokenClient,
@@ -81,12 +103,16 @@ impl MarketplaceContract {
             return Err(MarketplaceError::AlreadyInitialized);
         }
         admin.require_auth();
-        let config = Config { bot_nft, admin, fee_bps: FEE_BPS, fee_recipient };
+        let config = Config { bot_nft: bot_nft.clone(), admin: admin.clone(), fee_bps: FEE_BPS, fee_recipient: fee_recipient.clone() };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().set(&DataKey::NextListingId, &1u64);
         env.storage().instance().set(&DataKey::ActiveListings, &Vec::<u64>::new(&env));
         env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            symbol_short!("initialized"),
+            (admin, bot_nft, fee_recipient),
+        );
         Ok(())
     }
 
@@ -263,6 +289,78 @@ impl MarketplaceContract {
         env.storage().instance().get(&DataKey::Config).unwrap()
     }
 
+    pub fn set_fee_bps(env: Env, new_fee_bps: u32) -> Result<(), MarketplaceError> {
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+        let old_fee_bps = config.fee_bps;
+        config.fee_bps = new_fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            symbol_short!("fee_bps_updated"),
+            (old_fee_bps, new_fee_bps),
+        );
+        Ok(())
+    }
+
+    pub fn set_fee_recipient(env: Env, new_recipient: Address) -> Result<(), MarketplaceError> {
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+        let old_recipient = config.fee_recipient.clone();
+        config.fee_recipient = new_recipient;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            symbol_short!("fee_recipient_updated"),
+            (old_recipient, config.fee_recipient.clone()),
+        );
+        Ok(())
+    }
+
+    pub fn set_bot_nft(env: Env, new_bot_nft: Address) -> Result<(), MarketplaceError> {
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+        let old_nft = config.bot_nft.clone();
+        config.bot_nft = new_bot_nft;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            symbol_short!("bot_nft_updated"),
+            (old_nft, config.bot_nft.clone()),
+        );
+        Ok(())
+    }
+
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), MarketplaceError> {
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(MarketplaceError::NotInitialized)?;
+        config.admin.require_auth();
+        let old_admin = config.admin.clone();
+        config.admin = new_admin;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+        env.events().publish(
+            symbol_short!("admin_updated"),
+            (old_admin, config.admin.clone()),
+        );
+        Ok(())
+    }
+
     fn remove_active_listing(env: &Env, listing_id: u64) {
         let active: Vec<u64> = env
             .storage()
@@ -389,5 +487,71 @@ mod test {
         let env = Env::default();
         let (admin, bot, _, mkt) = setup(&env);
         assert!(mkt.try_initialize(&admin, &bot.address, &admin).is_err());
+    }
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let bot_nft_addr = env.register_contract(None, BotNFTContract);
+        let mkt_id = env.register_contract(None, MarketplaceContract);
+        let mkt = MarketplaceContractClient::new(&env, &mkt_id);
+        mkt.initialize(&admin, &bot_nft_addr, &admin);
+        let events = env.events().all();
+        assert!(events.len() >= 1);
+        let init_event = events.last().unwrap();
+        assert_eq!(init_event.0.get_unchecked(0), &symbol_short!("initialized").into_val(&env));
+    }
+
+    #[test]
+    fn test_set_fee_bps_emits_event() {
+        let env = Env::default();
+        let (_, _, _, mkt) = setup(&env);
+        let old_count = env.events().all().len();
+        mkt.set_fee_bps(&500u32).unwrap();
+        let events = env.events().all();
+        assert!(events.len() > old_count);
+        let config = mkt.config();
+        assert_eq!(config.fee_bps, 500);
+    }
+
+    #[test]
+    fn test_set_fee_recipient_emits_event() {
+        let env = Env::default();
+        let (_, _, _, mkt) = setup(&env);
+        let new_recipient = Address::generate(&env);
+        mkt.set_fee_recipient(&new_recipient).unwrap();
+        let config = mkt.config();
+        assert_eq!(config.fee_recipient, new_recipient);
+    }
+
+    #[test]
+    fn test_set_bot_nft_emits_event() {
+        let env = Env::default();
+        let (_, _, _, mkt) = setup(&env);
+        let new_nft = Address::generate(&env);
+        mkt.set_bot_nft(&new_nft).unwrap();
+        let config = mkt.config();
+        assert_eq!(config.bot_nft, new_nft);
+    }
+
+    #[test]
+    fn test_set_admin_emits_event() {
+        let env = Env::default();
+        let (admin, _, _, mkt) = setup(&env);
+        let new_admin = Address::generate(&env);
+        mkt.set_admin(&new_admin).unwrap();
+        let config = mkt.config();
+        assert_eq!(config.admin, new_admin);
+    }
+
+    #[test]
+    fn test_unauthorized_set_fee_bps_fails() {
+        let env = Env::default();
+        let (admin, bot, tok, mkt) = setup(&env);
+        let unauthorized = Address::generate(&env);
+        env.mock_all_auths_allowing_non_root_auth();
+        assert!(mkt.try_set_fee_bps(&500u32).is_err());
     }
 }
