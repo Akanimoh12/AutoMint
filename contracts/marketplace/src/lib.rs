@@ -11,6 +11,7 @@ pub enum DataKey {
     Listing(u64),
     ActiveListings,
     UserListings(Address),
+    UserPurchases(Address),
     NextListingId,
     Config,
     Initialized,
@@ -27,6 +28,17 @@ pub struct Listing {
     pub currency: Address,
     pub listed_at: u64,
     pub active: bool,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct Purchase {
+    pub listing_id: u64,
+    pub bot_id: u64,
+    pub seller: Address,
+    pub price: i128,
+    pub currency: Address,
+    pub purchased_at: u64,
 }
 
 #[derive(Clone)]
@@ -179,6 +191,15 @@ impl MarketplaceContract {
         listing.active = false;
         env.storage().persistent().set(&DataKey::Listing(listing_id), &listing);
         Self::remove_active_listing(&env, listing_id);
+        let purchase = Purchase {
+            listing_id,
+            bot_id: listing.bot_id,
+            seller: listing.seller.clone(),
+            price: listing.price,
+            currency: listing.currency,
+            purchased_at: env.ledger().timestamp(),
+        };
+        Self::add_user_purchase(&env, &buyer, purchase);
         env.events().publish(
             (symbol_short!("sold"), listing.seller.clone(), buyer.clone()),
             (listing_id, listing.bot_id, listing.price),
@@ -259,6 +280,24 @@ impl MarketplaceContract {
         result
     }
 
+    pub fn get_user_purchases(env: Env, buyer: Address, limit: u32) -> Vec<Purchase> {
+        let purchases: Vec<Purchase> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Purchase>>(&DataKey::UserPurchases(buyer))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result: Vec<Purchase> = Vec::new(&env);
+        let start = if purchases.len() > limit as usize {
+            purchases.len() - (limit as usize)
+        } else {
+            0
+        };
+        for i in start..purchases.len() {
+            result.push_back(purchases.get(i as u32).unwrap().clone());
+        }
+        result
+    }
+
     pub fn config(env: Env) -> Config {
         env.storage().instance().get(&DataKey::Config).unwrap()
     }
@@ -276,6 +315,21 @@ impl MarketplaceContract {
             }
         }
         env.storage().instance().set(&DataKey::ActiveListings, &new_active);
+    }
+
+    fn add_user_purchase(env: &Env, buyer: &Address, purchase: Purchase) {
+        let mut purchases: Vec<Purchase> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Purchase>>(&DataKey::UserPurchases(buyer.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        purchases.push_back(purchase);
+        env.storage().persistent().set(&DataKey::UserPurchases(buyer.clone()), &purchases);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserPurchases(buyer.clone()),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
     }
 }
 
@@ -389,5 +443,53 @@ mod test {
         let env = Env::default();
         let (admin, bot, _, mkt) = setup(&env);
         assert!(mkt.try_initialize(&admin, &bot.address, &admin).is_err());
+    }
+
+    #[test]
+    fn test_user_purchase_history() {
+        let env = Env::default();
+        let (_, bot, tok, mkt) = setup(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        tok.mint(&buyer, &1000_0000000_i128);
+        let bot_id = bot.mint_basic(&seller).unwrap();
+        mkt.list_bot(&seller, &bot_id, &0u32, &100_0000000_i128, &tok.address).unwrap();
+        mkt.buy_bot(&buyer, &1u64).unwrap();
+        let purchases = mkt.get_user_purchases(&buyer, &10u32);
+        assert_eq!(purchases.len(), 1);
+        let purchase = purchases.get(0).unwrap();
+        assert_eq!(purchase.listing_id, 1);
+        assert_eq!(purchase.bot_id, bot_id);
+        assert_eq!(purchase.seller, seller);
+        assert_eq!(purchase.price, 100_0000000_i128);
+    }
+
+    #[test]
+    fn test_bounded_purchase_history() {
+        let env = Env::default();
+        let (_, bot, tok, mkt) = setup(&env);
+        let seller = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        tok.mint(&buyer, &10000_0000000_i128);
+        for i in 0u32..15 {
+            let bot_id = bot.mint_basic(&seller).unwrap();
+            mkt.list_bot(&seller, &bot_id, &0u32, &100_0000000_i128, &tok.address).unwrap();
+            mkt.buy_bot(&buyer, &(i as u64 + 1)).unwrap();
+        }
+        let all_purchases = mkt.get_user_purchases(&buyer, &100u32);
+        assert_eq!(all_purchases.len(), 15);
+        let limited_purchases = mkt.get_user_purchases(&buyer, &5u32);
+        assert_eq!(limited_purchases.len(), 5);
+        let last_purchase = limited_purchases.get(4).unwrap();
+        assert_eq!(last_purchase.listing_id, 15);
+    }
+
+    #[test]
+    fn test_empty_purchase_history() {
+        let env = Env::default();
+        let (_, _, _, mkt) = setup(&env);
+        let buyer = Address::generate(&env);
+        let purchases = mkt.get_user_purchases(&buyer, &10u32);
+        assert_eq!(purchases.len(), 0);
     }
 }
